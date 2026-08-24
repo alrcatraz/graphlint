@@ -158,7 +158,7 @@ class CppEntryPointDetector:
     def _check_node_pattern(self, pattern: str, node: NodeInfo) -> bool:
         if pattern.startswith("function_def:"):
             name_pattern = pattern.split(":", 1)[1]
-            if node.node_type in ("method", "function"):
+            if node.node_type == "function":
                 return fnmatch.fnmatch(node.name, name_pattern)
         elif pattern.startswith("class_definition:"):
             cls_pattern = pattern.split(":", 1)[1]

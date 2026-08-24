@@ -684,6 +684,13 @@ class CppVisitor:
                     if c.type in ("identifier", "field_identifier"):
                         bare_name = c
                         break
+                    if c.type in ("pointer_declarator", "reference_declarator"):
+                        for gc in c.children:
+                            if gc.type in ("identifier", "field_identifier"):
+                                bare_name = gc
+                                break
+                        if bare_name is not None:
+                            break
                 if bare_name is not None and bare_type:
                     name = _node_text(bare_name)
                     qualified = sq + "." + name if sq else name
@@ -790,8 +797,12 @@ class CppVisitor:
             # Approach A member call: dispatch the receiver/member through
             # field-expression resolution so it emits a call edge via the
             # receiver's known type (falling back to a conservative edge
-            # when the type is unknown).
-            self._visit_field_expression(func)
+            # when the type is unknown).  ``is_arrow`` distinguishes a ``->``
+            # access (receiver is a pointer to the resolved type) from a ``.``
+            # access and drives the method lookup.
+            operator_node = func.child_by_field_name("operator")
+            is_arrow = operator_node is not None and _node_text(operator_node) == "->"
+            self._visit_field_expression(func, is_arrow=is_arrow)
         elif func:
             cname = _call_name_from_expr(func)
             if cname:
@@ -822,22 +833,27 @@ class CppVisitor:
     # Field expression — Approach A resolution
     # ------------------------------------------------------------------
 
-    def _visit_field_expression(self, node: Any) -> None:
+    def _visit_field_expression(self, node: Any, is_arrow: bool | None = None) -> None:
         """Handle ``obj.member`` / ``obj->member``.
 
         Approach A:
         - If receiver (obj) has a known type → resolve to method → call edge
         - If receiver is std::*, unknown pointer → conservative read edge
         - Walk parent inheritance chain to find the method
+
+        *is_arrow* distinguishes ``->`` (receiver is a pointer to the resolved
+        type) from ``.`` (receiver is the value); it is supplied by the caller
+        (call expressions) and computed here for standalone field expressions.
         """
         argument = node.child_by_field_name("argument")
         field_node = node.child_by_field_name("field")
         operator_node = node.child_by_field_name("operator")
 
         # Determine access type: . or ->
-        is_arrow = False
-        if operator_node is not None:
-            is_arrow = _node_text(operator_node) == "->"
+        if is_arrow is None:
+            is_arrow = False
+            if operator_node is not None:
+                is_arrow = _node_text(operator_node) == "->"
 
         member_name = _node_text(field_node) if field_node else ""
         for child in node.children:
@@ -852,7 +868,11 @@ class CppVisitor:
 
         sq = self._current_qname()
 
-        # Try Approach A resolution
+        # Try Approach A resolution.  ``is_arrow`` (a ``->`` access) means the
+        # receiver is a pointer to the resolved type; a ``.`` access resolves
+        # against the value type directly.  Either way the method is looked up
+        # on the receiver's (pointee/value) type, falling back to a
+        # conservative edge when the type is unknown.
         if argument is not None and argument.type == "identifier":
             receiver_name = _node_text(argument)
             type_name = self._var_types.get(receiver_name, "")
@@ -877,6 +897,16 @@ class CppVisitor:
                         line=_node_line(node),
                     ))
                     self.name_usages.add(member_name)
+            elif is_arrow:
+                # Arrow with a registered pointer type still resolves the
+                # pointee's method; a genuinely unknown receiver → read edge.
+                self.references.append(ReferenceInfo(
+                    source_qname=sq,
+                    target_name=member_name,
+                    edge_type="read",
+                    line=_node_line(node),
+                ))
+                self.name_usages.add(member_name)
             else:
                 # std:: or unknown/pointer → conservative read edge
                 self.references.append(ReferenceInfo(

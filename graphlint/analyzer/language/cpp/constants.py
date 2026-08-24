@@ -49,6 +49,60 @@ _CPP_SPECIAL_NAMES: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# Overloadable operator set — the finite, language-defined operators that may
+# appear after ``operator``. Anchors ``operator``-prefixed symbol names so a
+# plain free function such as ``operatorfoo`` is not treated as a special name.
+# ---------------------------------------------------------------------------
+
+_CPP_OPERATOR_NAMES: frozenset[str] = frozenset(
+    {
+        "operator+",
+        "operator-",
+        "operator*",
+        "operator/",
+        "operator%",
+        "operator^",
+        "operator&",
+        "operator|",
+        "operator~",
+        "operator!",
+        "operator=",
+        "operator<",
+        "operator>",
+        "operator+=",
+        "operator-=",
+        "operator*=",
+        "operator/=",
+        "operator%=",
+        "operator^=",
+        "operator&=",
+        "operator|=",
+        "operator<<",
+        "operator>>",
+        "operator>>=",
+        "operator<<=",
+        "operator==",
+        "operator!=",
+        "operator<=",
+        "operator>=",
+        "operator<=>",
+        "operator&&",
+        "operator||",
+        "operator++",
+        "operator--",
+        "operator,",
+        "operator->*",
+        "operator->",
+        "operator[]",
+        "operator()",
+        "operator new",
+        "operator delete",
+        "operator new[]",
+        "operator delete[]",
+    }
+)
+
+# ---------------------------------------------------------------------------
 # Default exclude patterns
 # ---------------------------------------------------------------------------
 

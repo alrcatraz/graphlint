@@ -725,6 +725,47 @@ int main() {
         cpp_main = [e for e in entries if e.rule_name == "cpp_main"]
         assert len(cpp_main) >= 1
 
+    def _entry_config(self):
+        return {
+            "entry_rules": [
+                {
+                    "name": "cpp_main",
+                    "file_pattern": "**/*.{cpp,cc,cxx,c,hpp,hh,hxx,h}",
+                    "ast_pattern": "function_def:main",
+                    "enabled": True,
+                    "description": "C++ main() entry point",
+                },
+            ],
+        }
+
+    def _detect(self, source):
+        from graphlint.analyzer.language.cpp.entry import CppEntryPointDetector
+        from graphlint.analyzer.language.cpp.parser import CppSourceParser
+
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, "main.cpp")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(source)
+        config = self._entry_config()
+        pr = CppSourceParser(tmp, config).parse_file(src)
+        detector = CppEntryPointDetector(config)
+        return detector.detect({"main.cpp": pr}, pr.nodes, {})
+
+    @tree_sitter_available
+    def test_entry_method_main_not_match(self):
+        """A class method named main must NOT be an entry point — C++ requires
+        main() to be a free function."""
+        entries = self._detect("class A { public: void main() {} };\n")
+        cpp_main = [e for e in entries if e.rule_name == "cpp_main"]
+        assert cpp_main == [], cpp_main
+
+    @tree_sitter_available
+    def test_entry_free_function_main_match(self):
+        """A free function main() IS an entry point."""
+        entries = self._detect("int main() { return 0; }\n")
+        cpp_main = [e for e in entries if e.rule_name == "cpp_main"]
+        assert len(cpp_main) >= 1, cpp_main
+
 
 class TestCppTestFileDetection:
     """PR #7 fix #2 — test-file detection sorting and conventions."""
@@ -845,6 +886,18 @@ class TestCppSpecialMethods:
         names = [n.name for n in _visitor.nodes if n.node_type == "method"]
         assert any(n == "operator==" for n in names), names
 
+    def test_is_special_name_anchored_to_operators(self):
+        """operator- and destructor names are special, but a plain free
+        function whose name merely starts with ``operator`` (no legal op) is
+        NOT."""
+        from graphlint.analyzer.language.cpp import CppAdapter
+
+        adapter = CppAdapter()
+        assert adapter.is_special_name("~Foo") is True
+        assert adapter.is_special_name("operator+") is True
+        assert adapter.is_special_name("operator*") is True
+        assert adapter.is_special_name("operatorfoo") is False
+
     def _build(self, files: dict[str, str]) -> Any:
         from graphlint.analyzer.graph import GraphBuilder
         from graphlint.analyzer.warnings import WarningCollector
@@ -915,6 +968,50 @@ int main() {
         refs = visitor.references
         assert all(r.edge_type != "call" or "bogus" not in r.target_name
                    or r.target_name.endswith(".bogus") for r in refs)
+
+    @tree_sitter_available
+    def test_field_call_is_arrow(self):
+        """p->update() (arrow) resolves the pointee type and emits a call to
+        Player.update."""
+        source = """\
+class Player {
+public:
+    void update() { }
+};
+int main() {
+    Player* p;
+    p->update();
+    return 0;
+}
+"""
+        visitor = _parse_source(source)
+        call_edges = [
+            r for r in visitor.references
+            if r.edge_type == "call" and "update" in r.target_name
+        ]
+        assert len(call_edges) >= 1, call_edges
+        assert all("Player.update" in r.target_name for r in call_edges), call_edges
+
+    def test_field_call_dot_fallback(self):
+        """obj.update() with an unknown receiver type → conservative edge
+        (no fabricated call to a resolved type)."""
+        source = """\
+class Player {
+public:
+    void update() { }
+};
+int foo() {
+    obj.update();
+    return 0;
+}
+"""
+        visitor = _parse_source(source)
+        call_edges = [
+            r for r in visitor.references
+            if r.edge_type == "call" and "update" in r.target_name
+        ]
+        for r in call_edges:
+            assert not r.target_name.endswith("Player.update"), r
 
 
 @tree_sitter_available

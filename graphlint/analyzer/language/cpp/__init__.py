@@ -10,6 +10,7 @@ from graphlint.analyzer._types import NodeInfo, ParseResult
 from graphlint.analyzer.language.base import LanguageAdapter
 from graphlint.analyzer.language.cpp.constants import (
     _CPP_DEFAULT_EXCLUDES,
+    _CPP_OPERATOR_NAMES,
     _CPP_PUBLIC_API_NAMES,
     _CPP_SPECIAL_NAMES,
     _CPP_EXTENSIONS,
@@ -70,10 +71,14 @@ class CppAdapter(LanguageAdapter):
     def is_special_name(self, name: str) -> bool:
         """C++ implicitly-invoked names: the explicit set plus destructors
         (``~Name``) and operator overloads (``operator+``, ``operator==`` …),
-        which the language calls without an explicit call site."""
+        which the language calls without an explicit call site.  Operator
+        names are anchored to the finite overloadable operator set so a plain
+        free function like ``operatorfoo`` is not treated as special."""
         if name in _CPP_SPECIAL_NAMES:
             return True
-        if name.startswith("~") or name.startswith("operator"):
+        if name.startswith("~"):
+            return True
+        if name in _CPP_OPERATOR_NAMES:
             return True
         return False
 
