@@ -4,9 +4,78 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from graphlint.analyzer.language.base import LanguageAdapter
+
+_HEADER_SNIFF_READ_BYTES: int = 64 * 1024
+
+# Word-bounded, token-level C++ markers. ``\\b`` around a keyword or symbol
+# keeps plain-C identifiers (e.g. a struct field named ``class_id``) from
+# tripping the C++ route, and the bare keyword never fires inside a comment or
+# string (those are stripped before matching). Plain-C constructs (``struct``,
+# ``#include <stdio.h>``) produce no C++ signal and stay on the C route.
+_HEADER_CPP_RE = re.compile(
+    r"\bclass\s+[A-Za-z_]\w*"
+    r"|\bnamespace\s+[A-Za-z_]"
+    r"|\btemplate\s*<"
+    r"|\bclass\s*[A-Za-z_]\w*\s*[:{]"
+    r"|\boperator\s*(?:load|store)?\b"
+    r"|\bstd::"
+    r"|\bconstexpr\b"
+    r"|\bnullptr\b"
+    r"|\breinterpret_cast\b|\bconst_cast\b|\bstatic_cast\b|\bdynamic_cast\b"
+    r"|\bexplicit\b|\bvirtual\b|\bfriend\b|\btypename\b|\bmutable\b|\bnoexcept\b"
+    r"|\bpublic\s*:|\bprivate\s*:|\bprotected\s*:"
+    r"|#\s*include\s*<\s*[A-Za-z_][A-Za-z0-9_]*\s*>\s*$"
+)
+
+_HEADER_CPP_INCLUDE_RE = re.compile(
+    r"#\s*include\s*[<\"][^>\"]*\.(?:hpp|hh|hxx|cc|cpp)[\">]"
+    r"|#\s*include\s*<\s*"
+    r"(?:"
+    r"iostream|istream|ostream|streambuf|sstream|fstream"
+    r"|algorithm|vector|string|array|map|set|unordered_map|iterator"
+    r"|memory|utility|typeinfo|functional|numeric|cstdint|cstring"
+    r"|thread|mutex|atomic|chrono|future|condition_variable"
+    r"|optional|variant|any|tuple|list|deque|stack|queue|bitset"
+    r")\s*>"
+)
+
+_HEADER_C_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_HEADER_LINE_COMMENT_RE = re.compile(r"//[^\n]*|#[^\n]*")
+
+
+def _strip_header_comments(text: str) -> str:
+    """Strip ``/*...*/``, ``//`` line, and C preprocessor ``#...`` comments so
+    C++ markers inside comments or directives don't mis-route the header."""
+    text = _HEADER_C_COMMENT_RE.sub(" ", text)
+    return _HEADER_LINE_COMMENT_RE.sub(" ", text)
+
+
+def sniff_header_language(path: str) -> str:
+    """Route a ``.h`` header to a language by content.
+
+    Reads the first :data:`_HEADER_SNIFF_READ_BYTES` bytes of *path*, strips
+    comments/directives, and looks for a C++-only construct. Returns ``"cpp"``
+    when a strong C++ marker is found, else ``"c"`` (backward compatible —
+    headers with no signal stay C).
+
+    Conservative by design: plain-C headers (``struct`` + ``#include <stdio.h>``)
+    must never be mis-routed to the C++ adapter.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(_HEADER_SNIFF_READ_BYTES)
+    except (OSError, UnicodeError):
+        return "c"
+    stripped = _strip_header_comments(head)
+    if _HEADER_CPP_RE.search(stripped):
+        return "cpp"
+    if _HEADER_CPP_INCLUDE_RE.search(head):
+        return "cpp"
+    return "c"
 
 _COMMON_EXCLUDE_DIRS: frozenset[str] = frozenset(
     {
@@ -48,6 +117,24 @@ class LanguageRegistry:
             key = ext.lower()
             return self._by_extension.get(key)
         return None
+
+    def adapter_for_parsing(self, path: str) -> Optional[LanguageAdapter]:
+        """Pick the adapter used to *parse* *path*.
+
+        Unlike :meth:`adapter_for_file` — which maps an ambiguous ``.h`` to the
+        single adapter registered for that extension (C) — this reads the file
+        content for ``.h`` and routes it to the C++ adapter when the header
+        contains C++ constructs, the C adapter otherwise. Non-ambiguous
+        extensions are routed purely by extension, unchanged.
+        """
+        _, ext = os.path.splitext(path)
+        if ext and ext.lower() == ".h":
+            language: str = sniff_header_language(path)
+            for adapter in self._adapters:
+                if adapter.language_name == language:
+                    return adapter
+            return self._by_extension.get(".h")
+        return self.adapter_for_file(path)
 
     # ------------------------------------------------------------------
     # File-system scanning
