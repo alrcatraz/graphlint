@@ -185,8 +185,14 @@ class CppVisitor:
         self._node_id: int = 1
         self._field_qnames: set[str] = set()
 
-        # Approach A: variable → type map (collected from declarations)
-        self._var_types: dict[str, str] = {}
+        # Variable → type tracking (Approach A).  Kept scope-aware so that
+        # locals do not leak across methods and a local may shadow a field:
+        #  - ``_field_var_types``: class members (visible to every method).
+        #  - ``_local_var_types``: innermost-first stack of block scopes.
+        #  - ``_global_var_types``: file-scope declarations.
+        self._field_var_types: dict[str, str] = {}
+        self._local_var_types: list[dict[str, str]] = []
+        self._global_var_types: dict[str, str] = {}
 
         # Depth of enclosing function/method bodies (distinguishing fields
         # from locals).
@@ -212,6 +218,39 @@ class CppVisitor:
     def _pop_scope(self) -> None:
         if self._context:
             self._context.pop()
+
+    def _push_local_scope(self) -> None:
+        self._local_var_types.append({})
+
+    def _pop_local_scope(self) -> None:
+        if self._local_var_types:
+            self._local_var_types.pop()
+
+    def _register_var_type(self, name: str, type_name: str, *, is_field: bool = False) -> None:
+        """Track *name → type_name* at the narrowest applicable scope.
+
+        Class fields go to the persistent field map (available to every
+        method), locals to the innermost enclosing block scope, and
+        file-scope names to ``_global_var_types``.
+        """
+        if not name or not type_name:
+            return
+        if is_field:
+            self._field_var_types[name] = type_name
+        elif self._local_var_types:
+            self._local_var_types[-1][name] = type_name
+        else:
+            self._global_var_types[name] = type_name
+
+    def _lookup_var_type(self, name: str) -> str:
+        """Nearest-scope receiver type lookup: innermost block, outer
+        blocks, then class fields, then file-scope names."""
+        for scope in reversed(self._local_var_types):
+            if name in scope:
+                return scope[name]
+        if name in self._field_var_types:
+            return self._field_var_types[name]
+        return self._global_var_types.get(name, "")
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -280,6 +319,16 @@ class CppVisitor:
         elif ntype == "delete_expression":
             self._visit_delete_expression(node)
 
+        elif ntype == "compound_statement":
+            # A block introduces a local-variable scope so that inner locals
+            # do not leak into the outer (function/file) scope.
+            self._push_local_scope()
+            try:
+                for child in node.children:
+                    self._walk(child)
+            finally:
+                self._pop_local_scope()
+
         elif ntype == "preproc_def":
             self._visit_preproc_def(node)
 
@@ -296,13 +345,23 @@ class CppVisitor:
 
     def _visit_namespace(self, node: Any) -> None:
         name_node = node.child_by_field_name("name")
-        if not name_node:
-            return
-        name = _scoped_name(name_node) or _node_text(name_node)
-        if not name:
-            return
-        self._push_scope(name)
+        name = _scoped_name(name_node) if name_node else ""
+        if name_node and not name:
+            name = _node_text(name_node)
         body = node.child_by_field_name("body")
+
+        if not name:
+            # Anonymous ``namespace { ... }``: there is no namespace to push,
+            # but the body still declares names in the enclosing scope and must
+            # be walked (a type/function inside it is a real symbol).
+            if body:
+                self._walk(body)
+            else:
+                for child in node.children:
+                    self._walk(child)
+            return
+
+        self._push_scope(name)
         if body:
             self._walk(body)
         else:
@@ -414,7 +473,7 @@ class CppVisitor:
             return
 
     def _visit_field_declaration(self, node: Any) -> None:
-        sq = self._current_qname()
+        sq = _strip_template_prefix(self._current_qname())
         # Walk children to find declarator identifiers
         type_ann = _extract_type_annotation(node)
 
@@ -477,7 +536,7 @@ class CppVisitor:
 
             # Approach A: register field's type for receiver resolution
             if type_ann:
-                self._var_types[name] = type_ann
+                self._register_var_type(name, type_ann, is_field=True)
 
             # Walk initializer
             value_node = (
@@ -622,6 +681,7 @@ class CppVisitor:
         self._method_scope_depth += 1
         prev_method_id = self._current_method_id
         self._current_method_id = nid
+        self._push_local_scope()
         self._emit_signature_type_reads(node, qualified, _node_line(node))
         try:
             body = node.child_by_field_name("body")
@@ -642,6 +702,7 @@ class CppVisitor:
             self._current_method_id = prev_method_id
             self._method_scope_depth -= 1
             self._pop_scope()
+            self._pop_local_scope()
 
     # ------------------------------------------------------------------
     # Variable declarations
@@ -676,7 +737,7 @@ class CppVisitor:
             if has_function_declarator:
                 # A function declaration (prototype) without a body is
                 # non-local; nothing to register here.
-                decl_type = None
+                pass
             else:
                 bare_type = _extract_type_annotation(node)
                 bare_name = None
@@ -712,7 +773,7 @@ class CppVisitor:
                         edge_type="write",
                         line=_node_line(node),
                     ))
-                    self._var_types[name] = bare_type
+                    self._register_var_type(name, bare_type, is_field=is_field)
                     self._emit_type_read_name(bare_type, sq, _node_line(node))
 
         for child in node.children:
@@ -769,7 +830,7 @@ class CppVisitor:
 
                 # Approach A: register variable's type
                 if type_ann:
-                    self._var_types[name] = type_ann
+                    self._register_var_type(name, type_ann, is_field=is_field)
 
                 # Walk initializer
                 value_node = child.child_by_field_name("value")
@@ -875,7 +936,17 @@ class CppVisitor:
         # conservative edge when the type is unknown.
         if argument is not None and argument.type == "identifier":
             receiver_name = _node_text(argument)
-            type_name = self._var_types.get(receiver_name, "")
+            type_name = self._lookup_var_type(receiver_name)
+
+            # Reading the receiver is itself a read of the variable (e.g.
+            # ``obj`` in ``obj.update()``), alongside the member edge below.
+            self.references.append(ReferenceInfo(
+                source_qname=sq,
+                target_name=receiver_name,
+                edge_type="read",
+                line=_node_line(node),
+            ))
+            self.name_usages.add(receiver_name)
 
             if type_name and not type_name.startswith("std::"):
                 # Check if the target method exists on the type or its parents
@@ -889,7 +960,11 @@ class CppVisitor:
                     ))
                     self.name_usages.add(member_name)
                 else:
-                    # Method not found — conservative read edge
+                    # Method not found — conservative read edge.  For a
+                    # ``::``-qualified receiver (e.g. ``engine::Service``) emit
+                    # the best-effort module-qualified member target too so a
+                    # same-named class in another module resolves to its own
+                    # method.
                     self.references.append(ReferenceInfo(
                         source_qname=sq,
                         target_name=member_name,
@@ -897,6 +972,15 @@ class CppVisitor:
                         line=_node_line(node),
                     ))
                     self.name_usages.add(member_name)
+                    qtarget = self._qualified_member_target(type_name, member_name)
+                    if qtarget:
+                        self.references.append(ReferenceInfo(
+                            source_qname=sq,
+                            target_name=qtarget,
+                            edge_type="read",
+                            line=_node_line(node),
+                        ))
+                        self.name_usages.add(qtarget.rsplit(".", 1)[-1])
             elif is_arrow:
                 # Arrow with a registered pointer type still resolves the
                 # pointee's method; a genuinely unknown receiver → read edge.
@@ -949,6 +1033,23 @@ class CppVisitor:
                     return tq
 
         return None
+
+    def _qualified_member_target(self, type_name: str, member_name: str) -> str:
+        """Best-effort qname for the *member* of a ``::``-qualified receiver.
+
+        ``engine::Service`` normalizes to ``engine.Service``; the class
+        defined in ``engine/Service.h`` parses as ``engine.Service.Service``,
+        so ``engine::Service().run()`` yields ``engine.Service.Service.run``.
+        With same-named classes in different modules the constructed target is
+        unique, unlike the bare ``run`` edge.
+        """
+        if "::" not in type_name or type_name.startswith("std::"):
+            return ""
+        cleaned = type_name.rstrip("*&").replace("::", ".")
+        parts = [p for p in cleaned.split(".") if p]
+        if len(parts) < 2:
+            return ""
+        return f"{cleaned}.{parts[-1]}.{member_name}"
 
     def _inherits_from(self, child_type: str, parent_type: str) -> bool:
         """Check if *child_type* (directly or transitively) inherits from
@@ -1075,6 +1176,20 @@ class CppVisitor:
                 edge_type="read", line=line,
             ))
             self.name_usages.add(type_name.split("::")[-1])
+            # A ``::``-qualified type (e.g. ``engine::Service``) read: also
+            # emit the best-effort qname of the class that would define it
+            # (``engine.Service.Service`` from ``engine/Service.h``), so the
+            # read can resolve to the right header in cross-file graphs.
+            if "::" in type_name:
+                normalized = type_name.replace("::", ".").strip(".*&")
+                parts = [p for p in normalized.split(".") if p]
+                if len(parts) >= 2:
+                    constructed = f"{normalized}.{parts[-1]}"
+                    self.references.append(ReferenceInfo(
+                        source_qname=sq, target_name=constructed,
+                        edge_type="read", line=line,
+                    ))
+                    self.name_usages.add(parts[-1])
 
     def _emit_parameter_type_reads(self, params: Any, sq: str, line: int) -> None:
         """Emit read edges for each parameter's declared type."""
@@ -1090,7 +1205,7 @@ class CppVisitor:
                 if pname_node is not None:
                     pname = _node_text(pname_node)
                     if pname and type_name:
-                        self._var_types[pname] = type_name
+                        self._register_var_type(pname, type_name)
 
     def _emit_signature_type_reads(self, node: Any, sq: str, line: int) -> None:
         """Emit read edges for a function's return type and parameter types."""

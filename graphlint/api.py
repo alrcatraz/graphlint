@@ -47,6 +47,11 @@ _OPTIONAL_LANG_SUPPORT: dict[str, tuple[str, str]] = {
     ".c": ("C", "pip install graphlint[c]"),
     ".h": ("C", "pip install graphlint[c]"),
     ".cpp": ("C++", "pip install graphlint[cpp]"),
+    ".cc": ("C++", "pip install graphlint[cpp]"),
+    ".cxx": ("C++", "pip install graphlint[cpp]"),
+    ".hpp": ("C++", "pip install graphlint[cpp]"),
+    ".hh": ("C++", "pip install graphlint[cpp]"),
+    ".hxx": ("C++", "pip install graphlint[cpp]"),
 }
 
 # Languages already hinted at in this process (dedupe).

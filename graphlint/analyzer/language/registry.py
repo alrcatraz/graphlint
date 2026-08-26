@@ -28,7 +28,6 @@ _HEADER_CPP_RE = re.compile(
     r"|\breinterpret_cast\b|\bconst_cast\b|\bstatic_cast\b|\bdynamic_cast\b"
     r"|\bexplicit\b|\bvirtual\b|\bfriend\b|\btypename\b|\bmutable\b|\bnoexcept\b"
     r"|\bpublic\s*:|\bprivate\s*:|\bprotected\s*:"
-    r"|#\s*include\s*<\s*[A-Za-z_][A-Za-z0-9_]*\s*>\s*$"
 )
 
 _HEADER_CPP_INCLUDE_RE = re.compile(
@@ -54,6 +53,15 @@ def _strip_header_comments(text: str) -> str:
     return _HEADER_LINE_COMMENT_RE.sub(" ", text)
 
 
+def _strip_header_comment_only(text: str) -> str:
+    """Strip ``/*...*/`` and ``//`` line comments only, keeping preprocessor
+    directives intact.  Used for the C++ ``#include`` signals, which are real
+    directives and must survive comment removal while comment-embedded
+    ``#include <...>`` lines are cleared."""
+    text = _HEADER_C_COMMENT_RE.sub(" ", text)
+    return re.sub(r"//[^\n]*", " ", text)
+
+
 def sniff_header_language(path: str) -> str:
     """Route a ``.h`` header to a language by content.
 
@@ -73,7 +81,11 @@ def sniff_header_language(path: str) -> str:
     stripped = _strip_header_comments(head)
     if _HEADER_CPP_RE.search(stripped):
         return "cpp"
-    if _HEADER_CPP_INCLUDE_RE.search(head):
+    # The C++ ``#include`` signals are directives, so they must be matched on
+    # comment-*only*-stripped text (directives preserved): a real
+    # ``#include <vector>`` counts, but one embedded in a ``//`` or ``/* */``
+    # comment does not.
+    if _HEADER_CPP_INCLUDE_RE.search(_strip_header_comment_only(head)):
         return "cpp"
     return "c"
 
@@ -111,29 +123,38 @@ class LanguageRegistry:
     # ------------------------------------------------------------------
 
     def adapter_for_file(self, path: str) -> Optional[LanguageAdapter]:
-        """Return the adapter that handles *path*, or ``None``."""
+        """Return the adapter that handles *path*, or ``None``.
+
+        Extension-based for all unambiguous suffixes (``.c`` → C,
+        ``.cpp/.hpp/...`` → C++). An ambiguous ``.h`` is routed by content
+        (see :func:`sniff_header_language`) so that a header sniffed as C++
+        resolves to the C++ adapter in every graph stage — module naming,
+        special-name / public-API checks, entry detection and adapter result
+        filtering — not just at parse time.
+        """
         _, ext = os.path.splitext(path)
         if ext and ext.startswith("."):
             key = ext.lower()
+            if key == ".h":
+                return self._adapter_for_header(path)
             return self._by_extension.get(key)
         return None
+
+    def _adapter_for_header(self, path: str) -> Optional[LanguageAdapter]:
+        """Sniff ``.h`` content and return the C-family adapter it belongs to."""
+        language: str = sniff_header_language(path)
+        for adapter in self._adapters:
+            if adapter.language_name == language:
+                return adapter
+        return self._by_extension.get(".h")
 
     def adapter_for_parsing(self, path: str) -> Optional[LanguageAdapter]:
         """Pick the adapter used to *parse* *path*.
 
-        Unlike :meth:`adapter_for_file` — which maps an ambiguous ``.h`` to the
-        single adapter registered for that extension (C) — this reads the file
-        content for ``.h`` and routes it to the C++ adapter when the header
-        contains C++ constructs, the C adapter otherwise. Non-ambiguous
-        extensions are routed purely by extension, unchanged.
+        Uses the same single decision path as :meth:`adapter_for_file`: an
+        ambiguous ``.h`` is routed by content, non-ambiguous extensions
+        purely by extension.
         """
-        _, ext = os.path.splitext(path)
-        if ext and ext.lower() == ".h":
-            language: str = sniff_header_language(path)
-            for adapter in self._adapters:
-                if adapter.language_name == language:
-                    return adapter
-            return self._by_extension.get(".h")
         return self.adapter_for_file(path)
 
     # ------------------------------------------------------------------

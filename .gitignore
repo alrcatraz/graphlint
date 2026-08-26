@@ -26,4 +26,3 @@ uv.lock
 # DSH plugin (integrations/dsh)
 integrations/dsh/node_modules/
 integrations/dsh/lib/
-/pr7-r2-fix234-dispatch.sh

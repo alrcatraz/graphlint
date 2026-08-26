@@ -176,3 +176,28 @@ class TestSniffParsesHeader:
         assert any("Point" in (n.name or "") for n in struct_nodes), [
             n.name for n in result.nodes
         ]
+
+# =============================================================================
+# comment-embedded C++ include signals must NOT trip the C++ route
+# =============================================================================
+
+
+class TestSniffCommentSafety:
+    def test_line_comment_include_not_signal(self):
+        """A ``// #include <vector>`` inside a line comment stays on the C route."""
+        path = _write_header("// #include <vector>\nint x;\n")
+        assert sniff_header_language(path) == "c"
+
+    def test_block_comment_include_not_signal(self):
+        """A ``/* #include <vector> */`` inside a block comment stays on the C route."""
+        path = _write_header("/* #include <vector> */\nint x;\n")
+        assert sniff_header_language(path) == "c"
+
+    def test_real_include_signals_cpp(self):
+        """A real ``#include <vector>`` directive signals C++ (and is preserved)."""
+        path = _write_header("#include <vector>\nint f();\n")
+        assert sniff_header_language(path) == "cpp"
+
+    def test_real_include_hpp_signals_cpp(self):
+        path = _write_header("#include \"util.hpp\"\nint f();\n")
+        assert sniff_header_language(path) == "cpp"

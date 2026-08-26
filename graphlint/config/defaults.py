@@ -309,7 +309,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         {
             "name": "cpp_main",
-            "file_pattern": "**/*.{cpp,cc,cxx,c,hpp,hh,hxx,h}",
+            "file_pattern": "**/*.{cpp,cc,cxx,hpp,hh,hxx}",
             "ast_pattern": "function_def:main",
             "enabled": True,
             "description": "C++ main() entry point",

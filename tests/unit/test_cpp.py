@@ -9,7 +9,6 @@ from typing import Any
 
 import pytest
 
-from graphlint.analyzer._types import NodeInfo, ParseResult
 from graphlint.analyzer.language.cpp.constants import (
     _CPP_PUBLIC_API_NAMES,
     _CPP_SPECIAL_NAMES,
@@ -768,7 +767,7 @@ int main() {
 
 
 class TestCppTestFileDetection:
-    """PR #7 fix #2 — test-file detection sorting and conventions."""
+    """C++ test-file detection: exact basenames, suffix/prefix and dir patterns."""
 
     def test_is_test_file_exact_test_basename(self):
         assert _is_test_file("test.cpp", {}) is True
@@ -818,7 +817,7 @@ class TestCppTestFileDetection:
 
 @tree_sitter_available
 class TestCppIncludesObjects:
-    """PR #7 fix #1: #include records are IncludeInfo objects."""
+    """C++ ``#include`` directives are produced as IncludeInfo objects with resolved local paths."""
 
     def test_imports_are_include_info_objects(self):
         from graphlint.analyzer.language.cpp.parser import CppSourceParser
@@ -839,7 +838,7 @@ class TestCppIncludesObjects:
 
 @tree_sitter_available
 class TestCppSpecialMethods:
-    """PR #7 fix #3: destructors / operators / constructors."""
+    """C++ implicitly-invoked special methods (constructors, destructors, operators)."""
 
     def test_destructor_not_flagged_dead(self):
         from graphlint.analyzer.language.cpp import CppAdapter
@@ -933,7 +932,7 @@ class TestCppSpecialMethods:
 
 @tree_sitter_available
 class TestCppApproachAMemberCall:
-    """PR #7 fix #4: Approach A member-call wiring."""
+    """C++ member-call resolution via the receiver's resolved type (Approach A)."""
 
     def test_member_call_resolved_via_receiver_type(self):
         source = """\
@@ -1014,9 +1013,124 @@ int foo() {
             assert not r.target_name.endswith("Player.update"), r
 
 
+class TestCppApproachAScoping:
+    """Approach A receiver-type scoping (B/C/D/E regressions)."""
+
+    def test_anonymous_namespace_members_are_visited(self):
+        """Members of an anonymous ``namespace { }`` are real symbols: no
+        synthetic qname segment is added, and they are walked for reachability."""
+        source = """\
+namespace {
+class Helper {
+public:
+    void work() { }
+};
+Helper helper;
+void free_fn() { helper.work(); }
+}
+int main() {
+    free_fn();
+    return 0;
+}
+"""
+        visitor = _parse_source(source, module_qname="mod")
+        qnames = {n.qualified_name for n in visitor.nodes}
+        assert "mod.Helper" in qnames, qnames
+        assert "mod.Helper.work" in qnames, qnames
+        assert "mod.free_fn" in qnames, qnames
+        assert "mod.helper" in qnames, qnames
+        # free_fn() is called from main; helper.work() resolves to the
+        # anonymous-namespace class's method (not a bare-name edge).
+        calls = [r for r in visitor.references if r.edge_type == "call"]
+        assert any(r.target_name == "free_fn" for r in calls), calls
+        assert any("mod.Helper.work" in r.target_name for r in calls), calls
+
+    def test_templated_class_field_qname_strips_template(self):
+        """A templated class's field qname is template_-free (same as its
+        type/method qnames)."""
+        source = """\
+template <typename T>
+class Box {
+public:
+    T value;
+    void set(const T& v) { value = v; }
+};
+"""
+        visitor = _parse_source(source, module_qname="mod")
+        qnames = {n.qualified_name for n in visitor.nodes}
+        assert "mod.Box" in qnames, qnames
+        assert "mod.Box.value" in qnames, qnames
+        assert "mod.Box.set" in qnames, qnames
+        assert all("template_." not in q for q in qnames), qnames
+
+    def test_scoped_var_types_no_cross_method_leak_and_field_shadow(self):
+        """Locals must not leak across methods, and a local shadows a class
+        field: receiver resolution targets the correct method."""
+        source = """\
+class Engine { public: void run() { } };
+class Car { public: void go() { } };
+class Garage {
+public:
+    Engine e;
+    void m1() {
+        Car e;
+        e.go();
+    }
+    void m2() {
+        e.run();
+    }
+};
+"""
+        visitor = _parse_source(source)
+        refs = visitor.references
+        # m1's local `Car e` shadows the `Engine e` field → Car.go.
+        go_calls = [
+            r.target_name for r in refs
+            if r.edge_type == "call" and "go" in r.target_name
+        ]
+        assert "test.Car.go" in go_calls, go_calls
+        assert all(not t.startswith("test.Engine") for t in go_calls), go_calls
+        # m2 reuses the name `e` with no local → the Engine field → Engine.run
+        # (a call edge, not a conservative untyped read).
+        run_calls = [
+            r.target_name for r in refs
+            if r.edge_type == "call" and r.target_name.endswith(".run")
+        ]
+        assert "test.Engine.run" in run_calls, run_calls
+        assert all(not t.startswith("test.Car") for t in run_calls), run_calls
+
+    def test_member_call_emits_receiver_read(self):
+        """``obj.update()`` reads the receiver variable alongside the member
+        edge."""
+        source = """\
+class Engine {
+public:
+    void start() { }
+};
+int main() {
+    Engine engine;
+    engine.start();
+    return 0;
+}
+"""
+        visitor = _parse_source(source)
+        refs = visitor.references
+        receiver_reads = [
+            r for r in refs if r.edge_type == "read" and r.target_name == "engine"
+        ]
+        assert receiver_reads, [
+            (r.edge_type, r.target_name) for r in refs
+        ]
+        calls = [
+            r.target_name for r in refs
+            if r.edge_type == "call" and r.target_name.endswith(".start")
+        ]
+        assert "test.Engine.start" in calls, calls
+
+
 @tree_sitter_available
 class TestCppOutOfClassMethods:
-    """PR #7 fix #5: out-of-class member definitions."""
+    """Out-of-class member definitions attach to their class as module-qualified methods."""
 
     def test_out_of_class_method_attached_to_class(self):
         source = """\
@@ -1038,3 +1152,278 @@ void Outer::Inner::g() { }
         methods = [n for n in visitor.nodes if n.node_type == "method"]
         qnames = [m.qualified_name for m in methods]
         assert "mod.Outer.Inner.g" in qnames, qnames
+
+
+@tree_sitter_available
+class TestCppCrossFileHeader:
+    """Cross-file ``.h`` + ``.cpp`` reproduction of the owner's case.
+
+    ``engine/Service.h`` declares ``class Service`` with an in-class
+    constructor, destructor and ``run()``; ``main.cpp`` instantiates and calls
+    ``run()``. The header must be module-qualified (``engine.Service``), and
+    the constructor / destructor must be recognised as implicitly-invoked so
+    they are not reported dead across the file boundary.
+    """
+
+    def _build(self, files: dict[str, str]) -> Any:
+        from graphlint.analyzer.graph import GraphBuilder
+        from graphlint.analyzer.warnings import WarningCollector
+        from graphlint.api import _build_registry
+        from graphlint.config.manager import ConfigManager
+
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            full = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(content)
+
+        config = ConfigManager(tmp).load()
+        config["_root_dir"] = tmp
+        registry = _build_registry()
+
+        # Route each file through the registry so a ``.h`` is sniffed to the
+        # C++ adapter consistently with the rest of the graph pipeline.
+        prs: dict[str, Any] = {}
+        for root, _d, fns in os.walk(tmp):
+            for fn in fns:
+                if not fn.endswith((".c", ".cpp", ".h", ".cc", ".cxx",
+                                    ".hpp", ".hh", ".hxx")):
+                    continue
+                full = os.path.join(root, fn)
+                adapter = registry.adapter_for_file(full)
+                if adapter is None:
+                    continue
+                rel = os.path.relpath(full, tmp).replace(os.sep, "/")
+                parsed = adapter.parse_file(full, tmp, config)
+                if parsed is not None:
+                    prs[rel] = parsed
+
+        wb = WarningCollector()
+        gb = GraphBuilder(wb, registry=registry, config=config)
+        return gb.build(prs), wb
+
+    def test_service_header_ctor_dtor_not_dead(self):
+        """Header ``engine.Service`` + ``main.cpp`` repro: qnames are
+        module-qualified, and the constructor/destructor are not dead."""
+        br, wb = self._build({
+            "engine/Service.h": (
+                "class Service {\n"
+                "public:\n"
+                "    Service() { }\n"
+                "    ~Service() { }\n"
+                "    void run() { }\n"
+                "};\n"
+            ),
+            "main.cpp": (
+                '#include "engine/Service.h"\n'
+                "int main() {\n"
+                "    Service s;\n"
+                "    s.run();\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+        })
+        nid_map = br.node_id_map
+        all_qnames = {
+            n.qualified_name for n in nid_map.values()
+        }
+        # engine/Service.h -> module engine.Service + class Service + methods.
+        assert "engine.Service.Service" in all_qnames, all_qnames
+        assert "engine.Service.Service.Service" in all_qnames, all_qnames
+        assert "engine.Service.Service.~Service" in all_qnames, all_qnames
+        assert "main.main" in all_qnames, all_qnames
+
+        live = {nid_map[n].qualified_name for n in br.reachable if n in nid_map}
+        # The constructor is recognised as implicitly-invoked (final segment
+        # equals its class segment) so it is reachable, not dead. Same for the
+        # destructor, which the C++ adapter special-names.
+        assert "engine.Service.Service.Service" in live, live
+        assert "engine.Service.Service.~Service" in live, live
+        # No dead_code warning may target header service members across the
+        # file boundary.
+        dead_warns = [w for w in wb.get_all() if w.warn_type == "dead_code"]
+        for w in dead_warns:
+            assert "engine.Service" not in (w.message or ""), w
+        # main.cpp resolves the call to Service.run (not left as an unbound
+        # name-only edge): some built edge targets the header's run node.  A
+        # cross-file member call parses as a read edge to the method, which
+        # reachability promotes into the call graph.
+        run_node = next(
+            n for n in nid_map.values()
+            if n.qualified_name == "engine.Service.Service.run"
+        )
+        run_edges = [
+            r for r in br.edges
+            if r.target_id == run_node.id and r.edge_type in ("call", "read")
+        ]
+        assert run_edges, [
+            (r.source_id, r.target_id, r.edge_type) for r in br.edges
+        ]
+
+    def test_same_name_in_two_headers_no_collision(self):
+        """Two headers with the same class name do not collide: qnames stay
+        module-qualified per header, and ``::``-qualified uses resolve to the
+        correct header's members."""
+        br, _wb = self._build({
+            "engine/Service.h": (
+                "class Service { public: Service() { } void run() { } void stop() { } };\n"
+            ),
+            "net/Service.h": (
+                "class Service { public: Service() { } void run() { } void stop() { } };\n"
+            ),
+            "main.cpp": (
+                '#include "engine/Service.h"\n'
+                '#include "net/Service.h"\n'
+                "int main() {\n"
+                "    engine::Service a;\n"
+                "    net::Service b;\n"
+                "    a.run();\n"
+                "    b.stop();\n"
+                "    return 0;\n"
+                "    }\n"
+            ),
+        })
+        nid_map = br.node_id_map
+        all_qnames = {
+            n.qualified_name for n in nid_map.values()
+        }
+        # Both headers contain a ``class Service`` with the same method names;
+        # their module-qualified qnames are distinct, proving same-named
+        # classes across headers do not collide.
+        assert "engine.Service.Service" in all_qnames, all_qnames
+        assert "net.Service.Service" in all_qnames, all_qnames
+        assert "engine.Service.Service.run" in all_qnames, all_qnames
+        assert "net.Service.Service.run" in all_qnames, all_qnames
+
+        engine_run = nid_map[next(
+            nid for nid, n in nid_map.items()
+            if n.qualified_name == "engine.Service.Service.run"
+        )]
+        net_stop = nid_map[next(
+            nid for nid, n in nid_map.items()
+            if n.qualified_name == "net.Service.Service.stop"
+        )]
+        engine_cls = nid_map[next(
+            nid for nid, n in nid_map.items()
+            if n.qualified_name == "engine.Service.Service"
+        )]
+        net_cls = nid_map[next(
+            nid for nid, n in nid_map.items()
+            if n.qualified_name == "net.Service.Service"
+        )]
+
+        def read_targets(nid: int) -> int:
+            return sum(
+                1 for r in br.edges
+                if r.target_id == nid and r.edge_type in ("call", "read")
+            )
+
+        # ``a.run()`` (engine::Service) must reach engine's run member, and
+        # ``b.stop()`` (net::Service) net's stop member — resolved against the
+        # right qualified nodes, not merged by bare name.
+        assert read_targets(engine_run.id) >= 1, [
+            (r.source_id, r.target_id, r.edge_type) for r in br.edges
+        ]
+        assert read_targets(net_stop.id) >= 1, [
+            (r.source_id, r.target_id, r.edge_type) for r in br.edges
+        ]
+        # The ``::``-qualified declarations read the exact header classes.
+        assert read_targets(engine_cls.id) >= 1
+        assert read_targets(net_cls.id) >= 1
+
+    def test_routing_survives_cwd_change(self):
+        """CWD-independent routing: with the working directory moved away from
+        the temp project, ``engine/Service.h`` still routes to the C++ adapter
+        in the module-qname, adapter-filtering, special-name and public-API
+        graph stages."""
+        from graphlint.analyzer.graph import GraphBuilder
+        from graphlint.analyzer.warnings import WarningCollector
+        from graphlint.api import _build_registry
+        from graphlint.config.manager import ConfigManager
+
+        files = {
+            "engine/Service.h": (
+                "class Service {\n"
+                "public:\n"
+                "    Service() { }\n"
+                "    ~Service() { }\n"
+                "    void run() { }\n"
+                "};\n"
+            ),
+            "main.cpp": (
+                '#include "engine/Service.h"\n'
+                "int main() {\n"
+                "    Service s;\n"
+                "    s.run();\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+        }
+        tmp = tempfile.mkdtemp()
+        for rel, content in files.items():
+            full = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(content)
+
+        config = ConfigManager(tmp).load()
+        config["_root_dir"] = tmp
+        registry = _build_registry()
+
+        prs: dict[str, Any] = {}
+        for rel, content in files.items():
+            adapter = registry.adapter_for_file(os.path.join(tmp, rel))
+            parsed = adapter.parse_file(os.path.join(tmp, rel), tmp, config)
+            prs[rel] = parsed
+
+        wb = WarningCollector()
+        gb = GraphBuilder(wb, registry=registry, config=config)
+
+        other = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        try:
+            os.chdir(other)
+            # Prove the CWD is not below the project root (relative sniffing
+            # against CWD alone would fail to find the header).
+            assert os.path.relpath(tmp, other).startswith("..")
+
+            # (1) module-qname routing for the header parse key.
+            assert gb._module_qname_for("engine/Service.h") == "engine.Service"
+
+            # (2) adapter filter: parse results routed by content sniffing,
+            # not by the raw relative key resolved against CWD.
+            cpp = registry.adapter_for_file(os.path.join(tmp, "main.cpp"))
+            cpp_keys = gb._adapter_parse_results(cpp, prs, registry, tmp)
+            assert "engine/Service.h" in cpp_keys, cpp_keys
+            c_adapter = registry.adapter_for_file(os.path.join(tmp, "main.c"))
+            c_keys = gb._adapter_parse_results(c_adapter, prs, registry, tmp)
+            assert "engine/Service.h" not in c_keys, c_keys
+
+            br = gb.build(prs)
+        finally:
+            os.chdir(cwd)
+
+        nid_map = br.node_id_map
+        file_id_to_path = {i: fp for i, fp in enumerate(prs, start=1)}
+        dtor = nid_map[next(
+            nid for nid, n in nid_map.items()
+            if n.qualified_name == "engine.Service.Service.~Service"
+        )]
+        run = nid_map[next(
+            nid for nid, n in nid_map.items()
+            if n.qualified_name == "engine.Service.Service.run"
+        )]
+
+        # (3) special-name stage: the destructor routes through the C++ adapter
+        # (a C-routed file would not special-name ``~Service``).
+        assert gb._node_is_special(dtor, file_id_to_path, frozenset())
+        # (4) public-API stage runs against the routed adapter.
+        assert gb._node_is_public_api(
+            run, file_id_to_path, frozenset({"main"})
+        ) is False
+
+        # (5) end-to-end: header ctor/dtor stay reachable across the boundary.
+        dead = [w for w in wb.get_all() if w.warn_type == "dead_code"]
+        for w in dead:
+            assert "engine.Service" not in (w.message or ""), w

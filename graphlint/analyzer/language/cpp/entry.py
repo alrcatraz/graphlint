@@ -191,9 +191,17 @@ class CppEntryPointDetector:
 
 
 def _is_cpp_file(path: str) -> bool:
-    """Check if *path* is a C++ source file."""
-    from graphlint.analyzer.language.cpp.constants import _CPP_EXTENSIONS
-    for ext in _CPP_EXTENSIONS:
+    """Check if *path* is a C++ source file.
+
+    ``.h`` is included: per the unified C-family routing a header only reaches
+    the C++ detector after content-sniffing has marked it C++, so it must be
+    accepted here (the coarse file_pattern guard disambiguates specific rules).
+    """
+    from graphlint.analyzer.language.cpp.constants import (
+        _CPP_EXTENSIONS,
+        _CPP_HEADER_OVERRIDE_EXTS,
+    )
+    for ext in (_CPP_EXTENSIONS | _CPP_HEADER_OVERRIDE_EXTS):
         if path.endswith(ext):
             return True
     return False

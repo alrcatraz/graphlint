@@ -141,14 +141,24 @@ _TYPE_MEMBER_NODE_TYPES: dict[str, str] = {
 
 _CPP_EXTENSIONS: frozenset[str] = frozenset({".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"})
 
+# ``.h`` is owned by the C adapter as a file extension, but when a header is
+# sniffed as C++ the C++ adapter owns it for analysis.  These suffixes let the
+# C++ ``_file_to_module`` still produce a module name for such a header.
+_CPP_HEADER_OVERRIDE_EXTS: frozenset[str] = frozenset({".h"})
+
 
 def _file_to_module(path: str) -> str:
     """Convert a C++ source path to its namespace-qualified name.
 
+    C++-owned headers (``.h`` sniffed as C++) are included so a header
+    ``engine/Service.h`` yields ``engine.Service``, matching the module names
+    the C++ adapter assigns to its other source files.
+
     >>> _file_to_module("src/Player.cpp")
     'src.Player'
     """
-    for ext in sorted(_CPP_EXTENSIONS, key=len, reverse=True):
+    exts = _CPP_EXTENSIONS | _CPP_HEADER_OVERRIDE_EXTS
+    for ext in sorted(exts, key=len, reverse=True):
         if path.endswith(ext):
             path_no_ext = path[:-len(ext)]
             break
